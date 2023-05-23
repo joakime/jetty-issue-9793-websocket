@@ -1,19 +1,24 @@
 package org.example;
 
+import org.eclipse.jetty.io.ByteBufferAccumulator;
 import org.eclipse.jetty.server.Server;
+import org.eclipse.jetty.server.ServerConnector;
 import org.eclipse.jetty.servlet.ServletContextHandler;
 import org.eclipse.jetty.servlet.ServletHolder;
 import org.eclipse.jetty.websocket.api.Frame;
 import org.eclipse.jetty.websocket.api.Session;
 import org.eclipse.jetty.websocket.api.annotations.OnWebSocketConnect;
 import org.eclipse.jetty.websocket.api.annotations.OnWebSocketFrame;
+import org.eclipse.jetty.websocket.api.annotations.OnWebSocketMessage;
 import org.eclipse.jetty.websocket.api.annotations.WebSocket;
+import org.eclipse.jetty.websocket.api.util.WSURI;
 import org.eclipse.jetty.websocket.server.*;
 import org.eclipse.jetty.websocket.server.config.JettyWebSocketServletContainerInitializer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nonnull;
 import java.io.IOException;
-import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.ByteBuffer;
 
@@ -23,9 +28,9 @@ public class DemoServer {
     public static final int SERVER_PORT = 20000;
     public static final String SERVER_PATH = "/messaging";
 
-    public static final int BUFFER_SIZE = 1024 * 1024 * 2;
+    public static URI SERVER_URI;
 
-    public static URI SERVER_URI = URI.create("ws://" + SERVER_HOST + ":" + SERVER_PORT + SERVER_PATH);
+    public static final int BUFFER_SIZE = 1024 * 1024 * 2;
 
     /**
      * Starts the webserver, waits for websocket messages from the {@link DemoClient#test() client} then exists.
@@ -35,9 +40,9 @@ public class DemoServer {
         long heapMaxSize = Runtime.getRuntime().maxMemory();
         System.out.println("Heap max size: " + heapMaxSize);
 
-        var server = new DemoServer();
-        server.stopOnShutdown();
+        DemoServer server = new DemoServer();
         server.start();
+        SERVER_URI = WSURI.toWebsocket(server.getURI());
 
         DemoClient.test();
 
@@ -47,41 +52,34 @@ public class DemoServer {
     final Server server;
 
     DemoServer() {
-        this.server = new Server(getServerInetSocketAddress());
+        this.server = new Server();
+        ServerConnector connector = new ServerConnector(server);
+        connector.setPort(SERVER_PORT);
+        connector.setHost(SERVER_HOST);
+        server.addConnector(connector);
     }
 
-    @Nonnull
-    protected URI getServerUri() {
-        return SERVER_URI;
+    URI getURI()
+    {
+        return this.server.getURI().resolve(SERVER_PATH);
     }
-
-    @Nonnull
-    protected InetSocketAddress getServerInetSocketAddress() {
-        return InetSocketAddress.createUnresolved(getServerUri().getHost(), getServerUri().getPort());
-    }
-
 
     void start() throws Exception {
-        //var connector = new ServerConnector(server);
-        //server.addConnector(connector);
-
-        var handler = createServletAndHandler();
+        ServletContextHandler handler = createServletAndHandler();
         server.setHandler(handler);
 
         server.start();
-        //System.out.println("Server started at port " + connector.getLocalPort());
-        System.out.println("Server started at port " + SERVER_URI);
+        System.out.println("Server started at port " + server.getURI());
     }
 
     private ServletContextHandler createServletAndHandler() {
-        var servlet = new JettyWebSocketServlet() {
+        JettyWebSocketServlet servlet = new JettyWebSocketServlet() {
             @Override
             protected void configure(JettyWebSocketServletFactory factory) {
-                //factory.addMapping("/", new EchoSocketCreator());
                 factory.setCreator(new ServerSocketCreator());
             }
         };
-        var handler = new ServletContextHandler();
+        ServletContextHandler handler = new ServletContextHandler();
         handler.addServlet(
                 new ServletHolder(servlet),
                 "/"
@@ -91,34 +89,18 @@ public class DemoServer {
         return handler;
     }
 
-    void stopOnShutdown() {
-        Runtime.getRuntime().addShutdownHook(
-                new Thread(this::safeStop)
-        );
-    }
-
-    private void safeStop() {
-        System.out.println("Shutting down WebSocketServer");
-        try {
-            server.stop();
-            System.out.println("Exiting WebSocketServer");
-        } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
-    }
-
     public static class ServerSocketCreator implements JettyWebSocketCreator {
-
         @Override
         public Object createWebSocket(JettyServerUpgradeRequest req, JettyServerUpgradeResponse resp) {
             return new ServerSocket();
         }
-
     }
 
     @WebSocket
     public static class ServerSocket {
+        private static final Logger LOG = LoggerFactory.getLogger(ServerSocket.class);
         private Session session;
+        private ByteBufferAccumulator byteBufferAccumulator = new ByteBufferAccumulator();
 
         @OnWebSocketConnect
         public void onWebSocketConnect(Session session) {
@@ -128,17 +110,35 @@ public class DemoServer {
             session.setOutputBufferSize(BUFFER_SIZE);
         }
 
+        // @OnWebSocketMessage
+        public void onWebSocketMessage(Session session, ByteBuffer message) throws IOException
+        {
+            if (DemoClient.check("Server receiving ", message))
+            {
+                session.getRemote().sendBytes(message);
+            }
+        }
+
         @OnWebSocketFrame
-        public void onWebSocketFrame(@Nonnull Session session, @Nonnull Frame frame) {
+        public void onWebSocketFrame(Session session, Frame frame) throws IOException
+        {
+            if (LOG.isDebugEnabled())
+                LOG.debug("onWebSocketFrame(): {}", frame);
             Frame.Type webSocketFrameType = frame.getType();
-            if ( frame.hasPayload() && webSocketFrameType == Frame.Type.BINARY ) {
-                try {
-                    ByteBuffer buffer = frame.getPayload();
-                    if ( DemoClient.check("Server receiving ", buffer) )
-                        session.getRemote().sendBytes(buffer);
-                }
-                catch (IOException e) {
-                    throw new RuntimeException(e);
+            // BROKEN TEST: does not check if CONTINUATION belongs to a previous a BINARY (fin=false) (and not a TEXT) frame.
+            if ( frame.hasPayload() && webSocketFrameType == Frame.Type.CONTINUATION || webSocketFrameType == Frame.Type.BINARY ) {
+                ByteBuffer buffer = frame.getPayload();
+                byteBufferAccumulator.copyBuffer(buffer);
+                if (frame.isFin()) {
+                    // take complete ByteBuffer,
+                    ByteBuffer completeMessage = byteBufferAccumulator.takeByteBuffer();
+                    try {
+                        if (DemoClient.check("Server receiving ", completeMessage)) {
+                            session.getRemote().sendBytes(buffer);
+                        }
+                    } finally {
+                        byteBufferAccumulator.getByteBufferPool().release(completeMessage);
+                    }
                 }
             }
         }

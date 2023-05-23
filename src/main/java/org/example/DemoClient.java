@@ -1,5 +1,6 @@
 package org.example;
 
+import org.eclipse.jetty.io.ByteBufferAccumulator;
 import org.eclipse.jetty.util.component.LifeCycle;
 import org.eclipse.jetty.websocket.api.Frame;
 import org.eclipse.jetty.websocket.api.Session;
@@ -9,6 +10,8 @@ import org.eclipse.jetty.websocket.api.annotations.OnWebSocketFrame;
 import org.eclipse.jetty.websocket.api.annotations.WebSocket;
 import org.eclipse.jetty.websocket.client.ClientUpgradeRequest;
 import org.eclipse.jetty.websocket.client.WebSocketClient;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nonnull;
 import java.io.IOException;
@@ -99,8 +102,9 @@ public class DemoClient implements Runnable {
 
     @WebSocket
     public static class ClientSocket {
-
+        private static final Logger LOG = LoggerFactory.getLogger(ClientSocket.class);
         private Session session;
+        private ByteBufferAccumulator byteBufferAccumulator = new ByteBufferAccumulator();
 
         @OnWebSocketConnect
         public void onWebSocketConnect(Session session) {
@@ -112,24 +116,32 @@ public class DemoClient implements Runnable {
 
         @OnWebSocketFrame
         public void onWebSocketFrame(@Nonnull Session session, @Nonnull Frame frame) {
+            if (LOG.isDebugEnabled())
+                LOG.debug("onWebSocketFrame(): {}", frame);
             Frame.Type webSocketFrameType = frame.getType();
-            if ( frame.hasPayload() && webSocketFrameType == Frame.Type.BINARY ) {
+            // BROKEN TEST: does not check if CONTINUATION belongs to a previous a BINARY (fin=false) (and not a TEXT) frame.
+            if (frame.hasPayload() && webSocketFrameType == Frame.Type.CONTINUATION || webSocketFrameType == Frame.Type.BINARY) {
                 ByteBuffer buffer = frame.getPayload();
-                check("Client receiving ", buffer);
+                byteBufferAccumulator.copyBuffer(buffer);
+                if (frame.isFin()) {
+                    ByteBuffer completeMessage = byteBufferAccumulator.takeByteBuffer();
+                    try {
+                        check("Client receiving ", completeMessage);
+                    } finally {
+                        byteBufferAccumulator.getByteBufferPool().release(completeMessage);
+                    }
+                }
             }
         }
 
         public void send(@Nonnull ByteBuffer payload) {
             try {
                 //System.out.println("Client sending " + payload);
-                session.getRemote().sendBytes(payload);
+                this.session.getRemote().sendBytes(payload);
             }
             catch (IOException e) {
                 throw new RuntimeException(e);
             }
         }
-
     }
-
-
 }
